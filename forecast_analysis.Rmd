@@ -1,0 +1,279 @@
+---
+title: "Blue Ridge Cabin Rentals | Demand Forecasting & Capacity Planning"
+author: "Pavani Priyanka Merla"
+date: "2026-10-24"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, fig.width=10, fig.height=5)
+library(fpp3)
+library(lubridate)
+library(dplyr)
+library(readr)
+library(knitr)
+```
+
+# Forecasting Workflow in R
+
+## 1 — Data Preparation & Exploration
+
+The downloaded CSV uses month/day/year dates (for example, `1/1/2014`), so I use `mdy()` rather than `ymd()` to parse the file correctly.
+
+```{r load-and-check}
+cabins <- read_csv("BlueRidgeCabins.csv", show_col_types = FALSE) |>
+  mutate(Month = yearmonth(mdy(Date))) |>
+  select(Month, Nights) |>
+  as_tsibble(index = Month)
+
+cabins
+
+cabins
+nrow(cabins)
+has_gaps(cabins)
+colSums(is.na(cabins))
+```
+
+There are `r nrow(cabins)` monthly observations. The gap check returns `r as.character(has_gaps(cabins))`, and the total number of missing values is `r sum(is.na(as_tibble(cabins)))`.
+
+```{r original-series}
+autoplot(cabins, Nights) +
+  labs(title="Monthly Cabin Nights Booked, 2014–2025", x="Month", y="Nights booked")
+```
+
+The bookings start at a lower level in 2014 and move upward over the years, with noticeably higher levels toward 2025. I can also see a repeating pattern of summer highs and winter lows, rather than random ups and downs. A few individual months are above or below the usual pattern, but the main feature is the regular seasonal shape. The distance between the high and low months becomes larger as the business grows, which makes me consider a multiplicative seasonal model.
+
+## 2 — Seasonality & Decomposition
+
+```{r seasonal-plot}
+cabins |>
+  gg_season(Nights, labels="both") +
+  labs(title="Bookings by Month and Year", y="Nights booked")
+```
+
+**(a)** July and August are the strongest months, with July generally reaching the highest bookings. January is usually the lowest. There is also a smaller pickup around October, but it does not reach the summer peak.
+
+```{r acf-plot}
+cabins |>
+  ACF(Nights, lag_max=36) |>
+  autoplot() +
+  labs(title="ACF of Monthly Cabin Nights")
+```
+
+**(b)** The positive bars at 12, 24, and 36 months show that bookings are similar to those in the same season one, two, and three years earlier. The high correlation at lag 1 and the slow decrease across nearby lags also suggest persistence and an underlying trend. These patterns support using models that account for both growth and annual seasonality.
+
+```{r stl-decomposition}
+dcmp <- cabins |>
+  model(STL(Nights)) |>
+  components()
+dcmp |> autoplot()
+```
+
+```{r stl-strength}
+stl_strength <- cabins |>
+  features(Nights, feat_stl) |>
+  select(trend_strength, seasonal_strength_year)
+stl_strength
+```
+
+**(c)** The trend panel moves upward, while the seasonal panel shows a clear yearly pattern. Looking at the original series and seasonal plot, the summer-to-winter gap becomes wider as bookings rise. That behavior suggests **multiplicative seasonality**, even though the standard STL decomposition itself is additive. The remainder is mostly around zero, with some months showing larger deviations.
+
+**(d)** Trend strength is `r round(stl_strength$trend_strength[[1]], 4)` and seasonal strength is `r round(stl_strength$seasonal_strength_year[[1]], 4)`. Both are very close to 1, so the data has a strong long-term trend and a strong seasonal pattern. This matches what I saw in the plots.
+
+## 3 — Train/Test Split & Benchmarks
+
+```{r split}
+train <- cabins |> filter(Month <= yearmonth("2023 Dec"))
+test <- cabins |> filter(Month >= yearmonth("2024 Jan"))
+cat("Training months:", nrow(train), "\nTest months:", nrow(test), "\n")
+```
+
+```{r benchmark-fit}
+bench_fit <- train |>
+  model(
+    Mean=MEAN(Nights),
+    Naive=NAIVE(Nights),
+    SNaive=SNAIVE(Nights),
+    Drift=RW(Nights ~ drift())
+  )
+bench_fit
+bench_fc <- bench_fit |> forecast(h=24)
+```
+
+```{r benchmark-plot}
+autoplot(bench_fc, cabins, level=NULL) +
+  labs(title="Benchmark Forecasts Compared with Actual Bookings", x="Month", y="Nights booked")
+```
+
+```{r benchmark-accuracy}
+bench_accuracy <- bench_fc |>
+  accuracy(cabins) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE) |>
+  arrange(MASE)
+kable(bench_accuracy, digits=2)
+bench_best <- bench_accuracy |> slice(1)
+```
+
+**(a)** I kept the last 24 months for testing because a real forecast always predicts what happens after the information used to fit it. A random split could mix future observations into training and give an unrealistic idea of performance.
+
+**(b)** `r bench_best$.model[[1]]` is the strongest benchmark, with test MASE `r round(bench_best$MASE[[1]], 2)` and MAE `r round(bench_best$MAE[[1]], 1)` nights. The seasonal naive method does well because the same months tend to be busy every year. Still, copying last year's monthly values cannot fully follow the rising booking level.
+
+**(c)** Its ME is `r round(bench_best$ME[[1]], 1)`, which is `r if (bench_best$ME[[1]] > 0) "positive" else "negative"`. That means the forecasts were generally `r if (bench_best$ME[[1]] > 0) "too low" else "too high"` compared with actual bookings. The growing demand helps explain why methods based mainly on older levels can fall short.
+
+## 4 — Model Development & Evaluation
+
+```{r advanced-fit}
+fit <- train |>
+  model(
+    SNaive=SNAIVE(Nights),
+    TSLM=TSLM(Nights ~ trend() + season()),
+    HW_add=ETS(Nights ~ error("A") + trend("A") + season("A")),
+    HW_mult=ETS(Nights ~ error("M") + trend("A") + season("M")),
+    Auto=ETS(Nights)
+  )
+fit
+```
+
+### Model reports
+
+```{r model-reports}
+report(fit |> select(TSLM))
+report(fit |> select(Auto))
+```
+
+```{r coefficients}
+tslm_coef <- tidy(fit |> select(TSLM))
+kable(tslm_coef, digits=3)
+trend_row <- tslm_coef |> filter(term == "trend()")
+july_row <- tslm_coef |> filter(grepl("season\\(\\).*7$", term))
+trend_est <- if (nrow(trend_row)) trend_row$estimate[[1]] else NA_real_
+july_est <- if (nrow(july_row)) july_row$estimate[[1]] else NA_real_
+```
+
+**(a)** The estimated trend coefficient is `r round(trend_est, 2)` **nights per month**. It represents the average monthly increase or decrease after accounting for the month of the year. The July seasonal coefficient is `r round(july_est, 2)` **nights**, measured relative to January, which is the reference month in this regression. A positive July coefficient means July is busier than January at the same trend level.
+
+```{r advanced-forecast}
+fc_test <- fit |> forecast(h=24)
+autoplot(fc_test, cabins, level=NULL) +
+  labs(title="Five Forecasting Models: 2024–2025 Test Period", x="Month", y="Nights booked")
+```
+
+```{r advanced-accuracy}
+model_accuracy <- fc_test |>
+  accuracy(cabins) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE) |>
+  arrange(MASE)
+kable(model_accuracy, digits=2)
+model_best <- model_accuracy |> slice(1)
+auto_test <- model_accuracy |> filter(.model == "Auto")
+```
+
+### Auto ETS specification
+
+```{r auto-specification}
+auto_report_lines <- capture.output(report(fit |> select(Auto)))
+auto_specs <- unlist(regmatches(auto_report_lines,
+  gregexpr("ETS\\([A-Z0-9]+,[A-Z0-9]+,[A-Z0-9]+\\)", auto_report_lines)))
+auto_spec <- if (length(auto_specs)) unique(auto_specs)[1] else "See Auto report above"
+cat("Selected model:", auto_spec, "\n")
+```
+
+**(b)** The automatic ETS specification is **`r auto_spec`**. The three positions describe the **error**, **trend**, and **seasonal** components, respectively. `A` means additive, `M` means multiplicative, and `N` means none. `r if (auto_spec == "ETS(M,A,M)") "This is the same structure as HW_mult and agrees with the growing seasonal swings in Task 2." else if (auto_spec == "ETS(A,A,A)") "This is the same structure as HW_add, although the earlier plots suggested that seasonal swings grow with the level." else "I compare this selected structure with the manually fitted additive and multiplicative Holt-Winters models above; the observed growing seasonal swings are an important point of comparison."`
+
+**(c)** The lowest test MASE belongs to **`r model_best$.model[[1]]`** (`r round(model_best$MASE[[1]], 2)`). The test plot helps explain the difference: a fixed additive seasonal adjustment can be too small in later years when the peak-to-trough booking difference has grown. Multiplicative seasonality scales with the booking level, so HW_mult can follow the larger summer peaks better than TSLM and HW_add. I use the test errors, rather than model complexity alone, to decide which one actually performed best.
+
+### Residual checks
+
+```{r auto-residual-plot, fig.height=8}
+fit |> select(Auto) |> gg_tsresiduals()
+```
+
+```{r ljung-box}
+lb_tslm <- augment(fit) |>
+  filter(.model == "TSLM") |>
+  fabletools::features(.innov, feasts::ljung_box,
+                       lag = 24, dof = 12)
+
+lb_auto <- augment(fit) |>
+  filter(.model == "Auto") |>
+  fabletools::features(.innov, feasts::ljung_box,
+                       lag = 24)
+
+lb_tslm
+lb_auto
+```
+
+**(d)** The Ljung-Box null hypothesis is that the residuals do not have autocorrelation through the lags being tested. The TSLM p-value is `r signif(lb_tslm$lb_pvalue[[1]], 3)` and the Auto p-value is `r signif(lb_auto$lb_pvalue[[1]], 3)`. `r if (lb_tslm$lb_pvalue[[1]] < .05) "For TSLM, the p-value is below 0.05, so I reject the null: the residuals still contain a pattern." else "For TSLM, the p-value is at least 0.05, so there is not enough evidence of remaining autocorrelation."` `r if (lb_auto$lb_pvalue[[1]] < .05) "For Auto, the p-value is below 0.05, which suggests the model has not captured all the time dependence." else "For Auto, the p-value is at least 0.05, so this test does not find strong evidence of leftover autocorrelation."` I also inspect the Auto residual plot for remaining seasonal spikes and changes in spread.
+
+## 5 — Rolling Time-Series Cross-Validation
+
+```{r cv-models}
+cabins_cv <- cabins |>
+  filter(Month <= yearmonth("2024 Dec")) |>
+  stretch_tsibble(.init=96, .step=12)
+
+cv_fit <- cabins_cv |>
+  model(SNaive=SNAIVE(Nights), Auto=ETS(Nights))
+cv_fc <- cv_fit |> forecast(h=12)
+cv_accuracy <- cv_fc |>
+  accuracy(cabins) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE) |>
+  arrange(MASE)
+kable(cv_accuracy, digits=2)
+cv_best <- cv_accuracy |> slice(1)
+auto_cv <- cv_accuracy |> filter(.model == "Auto")
+```
+
+**(a)** Across the four training windows, **`r cv_best$.model[[1]]`** has the lower average MASE (`r round(cv_best$MASE[[1]], 2)`). `r if (cv_best$.model[[1]] == model_best$.model[[1]]) "This agrees with the winner in Task 4." else "This differs from the winner in Task 4, which shows that a model's ranking can depend on the test period."`
+
+**(b)** One test period can be unusually easy or unusually difficult, especially when demand is changing. Evaluating several successive forecast windows gives me more evidence about how consistently a model works instead of relying on one result.
+
+## 6 — Forecast & Capacity Recommendation
+
+```{r final-forecast}
+final_fit <- cabins |> model(Auto=ETS(Nights))
+fc_2026 <- final_fit |> forecast(h=12)
+
+autoplot(fc_2026, cabins, level=c(80,95)) +
+  labs(title="Cabin Night Forecast for 2026 with 80% and 95% Intervals",
+       x="Month", y="Nights booked")
+```
+
+```{r busiest-month}
+peak_2026 <- fc_2026 |>
+  mutate(interval_95=hilo(Nights, 95)) |>
+  as_tibble() |>
+  slice_max(order_by=.mean, n=1, with_ties=FALSE) |>
+  select(Month, .mean, interval_95)
+peak_2026
+```
+
+The busiest forecast month is **`r as.character(peak_2026$Month[[1]])`**, with an expected `r round(peak_2026$.mean[[1]])` booked nights. Its 95% prediction interval is **`r as.character(peak_2026$interval_95[[1]])`**. The interval gives a range of plausible outcomes, not a guarantee that demand will fall inside it.
+
+### (a) Cleaning-capacity decision
+
+The underage cost is $120 per uncovered booked night and the overage cost is $40 per unused cleaning night. The critical ratio is $120 / ($120 + $40) = **0.75**, so I use the 75th percentile of the July forecast distribution.
+
+```{r july-plan}
+critical_ratio <- 120 / (120 + 40)
+july_plan <- fc_2026 |>
+  as_tibble() |>
+  filter(Month == yearmonth("2026 Jul")) |>
+  mutate(plan=quantile(Nights, critical_ratio)) |>
+  select(Month, .mean, plan)
+july_plan
+```
+
+For July 2026, the point forecast is `r round(july_plan$.mean[[1]])` nights and the recommended capacity is **`r ceiling(july_plan$plan[[1]])` nights**, rounded up to a whole night. This is `r if (july_plan$plan[[1]] > july_plan$.mean[[1]]) "above" else if (july_plan$plan[[1]] < july_plan$.mean[[1]]) "below" else "equal to"` the point forecast. Because missing a booked night costs three times as much as having one unused night of capacity, it makes sense to plan toward the higher side of likely demand.
+
+### (b) Recommendation to the owner
+
+I would use the 2026 forecast as a starting point for cleaning and maintenance planning, while keeping some flexibility for unexpectedly busy months. On the 2024–2025 test period, the Auto model's MASE was `r round(auto_test$MASE[[1]], 2)`; across the cross-validation windows its MASE was `r round(auto_cv$MASE[[1]], 2)`. `r if (lb_auto$lb_pvalue[[1]] >= .05) "The Ljung-Box check did not find strong evidence of remaining autocorrelation in the Auto model's residuals, which gives me more confidence in using it." else "The Ljung-Box check found remaining autocorrelation, so I would treat the forecast cautiously and review it regularly."` The busiest month is expected to be `r as.character(peak_2026$Month[[1]])`, at about `r round(peak_2026$.mean[[1]])` nights, with a 95% prediction interval of `r as.character(peak_2026$interval_95[[1]])`. Since uncovered bookings are costly, I would schedule extra cleaning capacity around the summer peak rather than staff exactly to the average forecast.
+
+# Development Notes
+
+This analysis originated as an academic forecasting project. ChatGPT assisted with R Markdown organization, explanations, and date-parsing troubleshooting. Results are computed by the included R code when the dataset is supplied.

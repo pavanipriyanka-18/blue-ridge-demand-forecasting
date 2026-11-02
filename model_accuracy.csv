@@ -1,0 +1,6 @@
+Model,ME,RMSE,MAE,MAPE,MASE
+ETS candidate (AIC),14.530,72.009,56.600,2.673,0.508
+Holt-Winters multiplicative,27.302,80.428,63.640,2.941,0.572
+Holt-Winters additive,-0.829,133.100,106.838,5.223,0.960
+Trend + season OLS,240.131,330.951,265.319,11.012,2.383
+Seasonal naive,290.208,341.264,290.208,13.034,2.607
