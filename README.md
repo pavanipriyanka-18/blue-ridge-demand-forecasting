@@ -83,18 +83,18 @@ Developed by **Pavani Priyanka Merla** as an academic project (October 2026). Ch
 **Note:** Charts 1–3 directly visualize the original monthly booking data; charts 4–5 are labeled Python/statsmodels reproductions of the R midterm modeling workflow, not exact R model outputs. The uncertainty intervals in chart 5 are approximations.
 
 ### 1. Historical bookings
-![Historical bookings](charts/01_historical_bookings.png)
+![Historical bookings](historical_bookings.png)
 
 ### 2. Seasonality
-![Monthly seasonality](charts/02_seasonality.png)
+![Monthly seasonality](seasonality.png)
 
 ### 3. Trend, seasonality, and residuals
-![STL decomposition](charts/03_stl_decomposition.png)
+![STL decomposition](decomposition.png)
 
 ### 4. Model comparison on held-out months
-![Model comparison](charts/04_model_comparison.png)
+![Model comparison](model_comparison.png)
 
 ### 5. 2026 forecast (Python approximation)
-![2026 forecast](charts/05_forecast_2026.png)
+![2026 forecast](forecast_2026.png)
 
 The model accuracy and forecast CSV tables are in `charts/`. Use `export_forecasting_charts.R` in RStudio with the authorized CSV to generate native `fpp3`/`fable` forecasts.
